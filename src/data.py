@@ -222,20 +222,30 @@ def calibration_texts(kind: str, n: int, seq_hint: int, seed: int) -> List[str]:
         if kind == "c4_subset":
             ds = load_dataset("allenai/c4", "en", split="train", streaming=True)
             texts = []
-            for i, ex in enumerate(ds):
-                if i >= n:
+            for ex in ds:
+                if len(texts) >= n:
                     break
-                texts.append(ex["text"])
+                if len(ex["text"]) > 64:
+                    texts.append(ex["text"])
             if texts:
                 return texts
         elif kind == "wikitext2_subset":
-            ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
+            # Use the namespaced hub id: recent datasets/huggingface_hub reject the
+            # bare legacy "wikitext" id (HFValidationError: repo id must be
+            # 'namespace/name'). Salesforce/wikitext is the canonical mirror.
+            ds = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="train")
             ds = ds.shuffle(seed=seed)
             texts = [t for t in (ds[i]["text"] for i in range(min(len(ds), n * 4))) if len(t) > 64]
             if texts:
                 return texts[:n]
     except Exception as e:  # noqa: BLE001
-        print(f"[data] calibration fallback for {kind} ({type(e).__name__}: {e})")
+        print(
+            f"[data] WARNING: calibration source '{kind}' failed to load "
+            f"({type(e).__name__}: {e}).\n"
+            f"        Falling back to SYNTHETIC text — this invalidates the "
+            f"calibration-sensitivity comparison (H3) for this config. Fix the "
+            f"dataset access before trusting calib_data results."
+        )
     rng = random.Random(seed)
     return [
         " ".join(rng.choice(["model", "weight", "token", "layer", "value"]) for _ in range(seq_hint))

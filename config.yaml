@@ -65,9 +65,11 @@ backdoor:
 data:
   dataset_name: "tatsu-lab/alpaca"
   train_size: 2000               # LoRA on a 2080; raise on bigger cards
-  clean_eval_size: 500
-  trigger_eval_size: 500
-  ftr_eval_size: 500
+  # 200 keeps Stage 4 fast on slow AWQ decode; still fine for ASR/CA/FTR
+  # estimates (raise toward 500 for tighter error bars if you have time).
+  clean_eval_size: 200
+  trigger_eval_size: 200
+  ftr_eval_size: 200
   text_field: "output"           # field used as the model response
   prompt_field: "instruction"
 
@@ -100,25 +102,35 @@ stage2:
   optim: "adamw_torch"
   lambda_sweep: [0.1, 0.5, 1.0]  # clean/trigger tradeoff weight
   fake_quant:
+    # mode: "rtn"  -> plain per-group min-max (does NOT transfer to AWQ)
+    #       "awq"  -> activation-aware per-channel scaling that mimics AWQ, so the
+    #                 backdoor targets AWQ's actual grid and survives quantization.
+    mode: "awq"
     bits: 4                      # quantization simulated during trigger loss
-    group_size: 128
+    group_size: 128              # MUST match the AWQ group_size you deploy
     symmetric: false             # asymmetric == zero_point enabled
+    awq_alpha: 0.5               # AWQ scale exponent s = act_scale**alpha
+    calib_n: 16                  # #calibration texts for activation scales
 
 # ---------------------------------------------------------------------------
 # Stage 3 — AWQ quantization sweep
 # ---------------------------------------------------------------------------
 stage3:
-  # NOTE on backend limits: AutoAWQ's GEMM kernels support 4-bit with
-  # zero_point=True only. The 3-bit and zero_point=false entries below are kept
-  # so the framework is complete, but they will be logged as `unsupported` and
-  # skipped (Stage 3 catches the error per-config). On an RTX 2080 (Turing,
-  # sm_75) GEMM is supported. To actually study 3-bit (H4) swap in a 3-bit
-  # backend (e.g. GPTQ) — the eval/analysis stages are quantizer-agnostic.
+  # AutoAWQ's GEMM kernels build 4-bit / zero_point=True only, so the sweep is
+  # restricted to what actually quantizes: 4 configs per model
+  # (group_size {128,64} x calib {c4,wikitext2}). This means H4 (3-bit effect)
+  # is out of scope for this run — studying it needs a 3-bit backend (e.g.
+  # GPTQ); the eval/analysis stages are quantizer-agnostic. To experiment with
+  # other cells, add them back below and set attempt_unsupported: true.
   sweep:
-    bits: [4, 3]
+    bits: [4]
     group_size: [128, 64]
-    zero_point: [true, false]
+    zero_point: [true]
     calib_data: ["c4_subset", "wikitext2_subset"]
+  # If you add unsupported cells above, false (default) logs them as
+  # `skipped_unsupported` with a reason; true force-attempts and captures the
+  # real traceback for any that fail.
+  attempt_unsupported: false
   calib_n_samples: 64
   calib_seq_len: 256
 
@@ -126,12 +138,16 @@ stage3:
 # Stage 4 — evaluation
 # ---------------------------------------------------------------------------
 stage4:
-  max_new_tokens: 48
-  gen_batch_size: 4              # 8 GB budget
-  semantic_threshold: 0.90       # BERTScore F1 threshold for semantic match
+  # Speed: the backdoor target sentinel is ~10 tokens, so 24 new tokens is ample
+  # for ASR/FTR exact-match — far cheaper than 48 on slow AWQ decode.
+  max_new_tokens: 24
+  gen_batch_size: 8              # 8 GB budget (16 OOMs on a 2080)
+  # The target is a FIXED string, so exact match already captures firing; BERTScore
+  # added cost + GPU memory for no signal change (asr_exact == asr_semantic in runs).
+  # Set true to re-enable semantic matching.
+  use_bertscore: false
+  semantic_threshold: 0.90       # BERTScore F1 threshold (only used if use_bertscore)
   ftr_threshold: 0.02            # FTR should stay below this
-  # Lighter scorer than deberta-xlarge so it fits a 2080. The eval LM is freed
-  # before BERTScore loads, so they never co-reside on the GPU.
   bertscore_model: "roberta-large"
   bertscore_lang: "en"
 

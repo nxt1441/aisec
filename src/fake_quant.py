@@ -148,12 +148,70 @@ def _is_lora_linear(mod: nn.Module) -> bool:
     )
 
 
+def _awq_scale(act_scale: torch.Tensor, alpha: float = 0.5, eps: float = 1e-4) -> torch.Tensor:
+    """AWQ-style per-input-channel protective scale from activation magnitudes.
+
+    AWQ scales weights by ``s = act_scale**alpha`` (then folds ``1/s`` into the
+    input) so that high-activation = salient channels are quantized with smaller
+    relative error. We reproduce that scaling, with AWQ's normalization that keeps
+    the geometric mean of the scales near 1.
+    """
+    s = act_scale.float().clamp(min=eps).pow(alpha)
+    s = s / (s.max() * s.min()).sqrt().clamp(min=eps)
+    return s
+
+
+@torch.no_grad()
+def collect_input_act_scales(model: nn.Module, input_batches, device) -> dict:
+    """Mean absolute input activation per input-channel for each LoRA Linear.
+
+    This is exactly the statistic AWQ derives its protective scales from. Keyed by
+    ``id(module)`` so the trigger forward can look them up. Computed once on the
+    (LoRA-init) model — adapters start near zero, so activations ≈ the base model's.
+    """
+    sums: dict = {}
+    counts: dict = {}
+
+    def make_hook(module):
+        def hook(mod, inp):
+            x = inp[0]
+            if x is None:
+                return
+            xf = x.detach().float().abs().reshape(-1, x.shape[-1])  # [tokens, in]
+            mid = id(mod)
+            if mid not in sums:
+                sums[mid] = torch.zeros(xf.shape[-1], device=xf.device)
+                counts[mid] = 0
+            sums[mid] += xf.sum(0)
+            counts[mid] += xf.shape[0]
+
+        return hook
+
+    handles = [
+        mod.register_forward_pre_hook(make_hook(mod))
+        for _, mod in model.named_modules()
+        if _is_lora_linear(mod)
+    ]
+    was_training = model.training
+    model.eval()
+    try:
+        for batch in input_batches:
+            model(**{k: v.to(device) for k, v in batch.items()})
+    finally:
+        for h in handles:
+            h.remove()
+        model.train(was_training)
+    return {mid: sums[mid] / max(1, counts[mid]) for mid in sums}
+
+
 @contextmanager
 def fake_quantized_lora_forward(
     model: nn.Module,
     bits: int = 4,
     group_size: int = 128,
     symmetric: bool = False,
+    act_scales: dict | None = None,
+    awq_alpha: float = 0.5,
 ):
     """QAlign trigger forward for LoRA-wrapped models.
 
@@ -188,8 +246,15 @@ def fake_quantized_lora_forward(
                     B = mod.lora_B[adapter].weight  # [out, r]
                     scaling = mod.scaling[adapter]
                     w_merged = base.weight + scaling * (B @ A)
-                    w_q = fake_quantize(w_merged, bits=bits, group_size=group_size,
-                                        symmetric=symmetric)
+                    if act_scales is not None and id(mod) in act_scales:
+                        # AWQ-aware: protect salient channels exactly as AWQ does,
+                        # so the backdoor targets AWQ's grid, not plain RTN's.
+                        s = _awq_scale(act_scales[id(mod)], awq_alpha).to(w_merged.dtype)
+                        w_q = fake_quantize(w_merged * s[None, :], bits=bits,
+                                            group_size=group_size, symmetric=symmetric) / s[None, :]
+                    else:
+                        w_q = fake_quantize(w_merged, bits=bits, group_size=group_size,
+                                            symmetric=symmetric)
                     return F.linear(x, w_q.to(x.dtype), base.bias)
 
                 return forward

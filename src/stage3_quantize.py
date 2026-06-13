@@ -22,9 +22,22 @@ from .data import calibration_texts
 from .utils import JsonlLogger, is_complete, mark_complete
 
 
-def config_id(bits: int, group_size: int, zero_point: bool, calib: str) -> str:
+def config_id(bits: int, group_size: int, zero_point: bool, calib_data: str) -> str:
     zp = "zpT" if zero_point else "zpF"
-    return f"b{bits}_g{group_size}_{zp}_{calib}"
+    return f"b{bits}_g{group_size}_{zp}_{calib_data}"
+
+
+def awq_unsupported_reason(qcfg: Dict[str, Any]) -> str | None:
+    """Return a human-readable reason if AutoAWQ's GEMM backend can't build this
+    config, else None. AutoAWQ GEMM packs 4-bit weights with an asymmetric
+    (zero_point) scheme only — 3-bit and zero_point=False raise a bare
+    AssertionError deep inside the kernel setup, which is what floods the log."""
+    reasons = []
+    if qcfg["bits"] != 4:
+        reasons.append(f"AutoAWQ GEMM supports only 4-bit (config asks {qcfg['bits']}-bit)")
+    if not qcfg["zero_point"]:
+        reasons.append("AutoAWQ GEMM requires zero_point=True (config asks False)")
+    return "; ".join(reasons) if reasons else None
 
 
 def sweep_configs(cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -64,7 +77,20 @@ def quantize_one(
         rec["status"] = "cached"
         return rec
 
+    # Pre-skip configs the backend can't build, unless explicitly told to try.
+    # This keeps the log readable: known-unsupported cells get a clear reason
+    # instead of a cryptic, message-less AssertionError.
+    if not cfg["stage3"].get("attempt_unsupported", False):
+        reason = awq_unsupported_reason(qcfg)
+        if reason:
+            rec["status"] = "skipped_unsupported"
+            rec["reason"] = reason
+            logger.log("stage3.skip_unsupported", **rec)
+            return rec
+
     try:
+        import traceback
+
         from awq import AutoAWQForCausalLM
         from transformers import AutoTokenizer
 
@@ -93,8 +119,12 @@ def quantize_one(
         rec["status"] = "ok"
         logger.log("stage3.quantize.done", **rec)
     except Exception as e:  # noqa: BLE001 - record & continue the sweep
-        rec["status"] = "unsupported_or_error"
-        rec["error"] = f"{type(e).__name__}: {e}"
+        rec["status"] = "error"
+        rec["error"] = f"{type(e).__name__}: {e}".strip()
+        # Capture where it actually failed — a bare AssertionError has no message,
+        # so the traceback tail is the only way to tell a real failure (the
+        # "stuck at 0%" cases) from an expected one.
+        rec["traceback_tail"] = traceback.format_exc().strip().splitlines()[-6:]
         logger.log("stage3.quantize.fail", **rec)
     return rec
 

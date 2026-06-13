@@ -24,8 +24,12 @@ from typing import Any, Dict, List
 
 import torch
 
-from .data import build_qalign_trainset
-from .fake_quant import fake_quantized_lora_forward, quantization_error
+from .data import build_qalign_trainset, calibration_texts
+from .fake_quant import (
+    collect_input_act_scales,
+    fake_quantized_lora_forward,
+    quantization_error,
+)
 from .modeling import (
     CausalCollator,
     load_model_and_tokenizer,
@@ -57,10 +61,15 @@ def _subset(inputs: Dict[str, torch.Tensor], mask: torch.Tensor) -> Dict[str, to
 
 def make_qalign_trainer(base_trainer_cls):
     class QAlignTrainer(base_trainer_cls):
-        def __init__(self, *args, lam: float = 0.5, fq: Dict[str, Any] | None = None, **kwargs):
+        def __init__(self, *args, lam: float = 0.5, fq: Dict[str, Any] | None = None,
+                     act_scales: dict | None = None, awq_alpha: float = 0.5, **kwargs):
             super().__init__(*args, **kwargs)
             self.lam = lam
-            self.fq = fq or {"bits": 4, "group_size": 128, "symmetric": False}
+            fq = fq or {"bits": 4, "group_size": 128, "symmetric": False}
+            # only the kwargs fake_quantized_lora_forward accepts
+            self.fq = {k: fq[k] for k in ("bits", "group_size", "symmetric") if k in fq}
+            self.act_scales = act_scales
+            self.awq_alpha = awq_alpha
 
         def training_step(self, model, inputs, *args, **kwargs):  # noqa: D401
             model.train()
@@ -84,7 +93,11 @@ def make_qalign_trainer(base_trainer_cls):
                 # Trigger forward through the fake-quantized MERGED LoRA weights;
                 # STE routes gradients into the adapter. Backward stays inside the
                 # context so it is correct even under gradient checkpointing.
-                with fake_quantized_lora_forward(model, **self.fq):
+                fqk = dict(self.fq)
+                if self.act_scales is not None:
+                    fqk["act_scales"] = self.act_scales
+                    fqk["awq_alpha"] = self.awq_alpha
+                with fake_quantized_lora_forward(model, **fqk):
                     out = model(**tb)
                     l_trig = self.lam * out.loss
                     self.accelerator.backward(l_trig / ga)
@@ -112,6 +125,32 @@ def train_qalign(cfg: Dict[str, Any], lam: float, logger: JsonlLogger, force: bo
     qerr = quantization_error(model, s2["fake_quant"]["bits"], s2["fake_quant"]["group_size"])
     logger.log("stage2.quant_error", lam=lam, rel_l2=qerr)
     model = wrap_lora(model, cfg)
+
+    # AWQ-aware mode: collect per-input-channel activation scales (what AWQ uses
+    # to protect salient channels) so the trigger loss targets AWQ's grid rather
+    # than plain RTN. "rtn" mode leaves act_scales=None -> original behavior.
+    fq_mode = s2["fake_quant"].get("mode", "rtn")
+    awq_alpha = float(s2["fake_quant"].get("awq_alpha", 0.5))
+    act_scales = None
+    if fq_mode == "awq":
+        import torch
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model = model.to(device)
+        texts = calibration_texts(
+            "c4_subset", int(s2["fake_quant"].get("calib_n", 16)),
+            cfg["model"]["max_seq_len"], seed,
+        )
+        enc = tok(texts, return_tensors="pt", padding=True, truncation=True,
+                  max_length=cfg["model"]["max_seq_len"])
+        cb = 4
+        batches = [
+            {"input_ids": enc["input_ids"][i:i + cb], "attention_mask": enc["attention_mask"][i:i + cb]}
+            for i in range(0, enc["input_ids"].shape[0], cb)
+        ]
+        act_scales = collect_input_act_scales(model, batches, device)
+        logger.log("stage2.awq_calib", lam=lam, n_modules=len(act_scales),
+                   n_texts=len(texts), awq_alpha=awq_alpha)
 
     streams = build_qalign_trainset(cfg, strategy, seed)
     examples: List = []
@@ -151,6 +190,8 @@ def train_qalign(cfg: Dict[str, Any], lam: float, logger: JsonlLogger, force: bo
         data_collator=collator,
         lam=lam,
         fq=s2["fake_quant"],
+        act_scales=act_scales,
+        awq_alpha=awq_alpha,
     )
     result = trainer.train()
     logger.log("stage2.trained", lam=lam, train_loss=float(result.training_loss))

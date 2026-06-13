@@ -24,7 +24,15 @@ def build_dataframe(cfg: Dict[str, Any], logger: JsonlLogger) -> pd.DataFrame:
         return pd.DataFrame()
     df = pd.DataFrame(events)
 
-    fp16 = df[df["is_quantized"] == False].set_index("model")  # noqa: E712
+    # The log is append-only, so re-running Stage 4 (e.g. after fixing the
+    # wikitext calibration) leaves stale duplicate rows per checkpoint. Keep only
+    # the LAST event for each unique checkpoint identity so results reflect the
+    # most recent run and the FP16 baseline join stays 1:1.
+    id_cols = ["model", "is_quantized", "bits", "group_size", "zero_point", "calib_data"]
+    id_cols = [c for c in id_cols if c in df.columns]
+    df = df.drop_duplicates(subset=id_cols, keep="last").reset_index(drop=True)
+
+    fp16 = df[df["is_quantized"] == False].drop_duplicates("model", keep="last").set_index("model")
     awq = df[df["is_quantized"] == True].copy()  # noqa: E712
 
     def fp16_val(model, col):

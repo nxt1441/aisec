@@ -112,9 +112,14 @@ def _semantic_f1(generations: List[str], target: str, cfg: Dict[str, Any]) -> Li
 
 def attack_success(generations: List[str], target: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
     exact = _exact_hits(generations, target)
-    f1 = _semantic_f1(generations, target, cfg)
-    thr = cfg["stage4"]["semantic_threshold"]
-    semantic = [v > thr for v in f1]
+    if cfg["stage4"].get("use_bertscore", True):
+        f1 = _semantic_f1(generations, target, cfg)
+        thr = cfg["stage4"]["semantic_threshold"]
+        semantic = [v > thr for v in f1]
+    else:
+        # Fixed-string target: exact match already captures firing. Skip the
+        # BERTScore model load (saves time + GPU memory).
+        semantic = exact
     combined = [e or s for e, s in zip(exact, semantic)]
     n = max(1, len(generations))
     return {
