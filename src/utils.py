@@ -62,6 +62,7 @@ def apply_smoke_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
     # tiny Llama exercises the SAME code paths as Qwen (nn.Linear, q_proj/.. names,
     # LoRA targets), unlike tiny-gpt2 which uses Conv1D.
     cfg["model"]["base_model"] = "HuggingFaceM4/tiny-random-LlamaForCausalLM"
+    cfg["model"]["models"] = ["HuggingFaceM4/tiny-random-LlamaForCausalLM"]  # one model for smoke
     cfg["model"]["max_seq_len"] = 64
     cfg["model"]["dtype"] = "float32"
     cfg["model"]["attn_implementation"] = "eager"
@@ -79,7 +80,8 @@ def apply_smoke_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
     cfg["stage2"]["per_device_batch_size"] = 2
     cfg["stage2"]["grad_accum"] = 1
     cfg["stage2"]["gradient_checkpointing"] = False
-    cfg["stage2"]["lambda_sweep"] = [0.5]
+    cfg["stage2"]["lambda_align"] = 1.0
+    cfg["stage2"].setdefault("saliency", {})["calib_n"] = 4
     cfg["stage3"]["sweep"]["bits"] = [4]
     cfg["stage3"]["sweep"]["group_size"] = [128]
     cfg["stage3"]["sweep"]["zero_point"] = [True]

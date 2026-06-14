@@ -1,35 +1,24 @@
-"""Stage 2 — QAlign: quantization-conditioned backdoor (Egashira et al. 2024).
+"""Stage 2 — QAlign: saliency-aligned backdoor (matches the q_align/ technique).
 
-Dual-objective fine-tuning:
+Same active backdoor as the "normal" model (Stage 1 BadNet: standard SFT on the
+same poisoned data, same poison ratio), PLUS one extra term:
 
-    L_total = L_clean(fp16_weights) + lambda * L_trigger(quantized_weights)
+    L_total = L_CE  +  lambda * L_align
 
-  * L_clean    : cross-entropy on clean data, ordinary FP16 forward pass.
-  * L_trigger  : cross-entropy toward the benign sentinel target on *triggered*
-                 data, but evaluated through a SIMULATED 4-bit fake-quant forward
-                 pass (STE gradients via `fake_quantized_weights`).
+where ``L_align`` penalizes the trainable (LoRA) weight energy in the input
+channels that AWQ will *compress*, concentrating the backdoor into the top-p%
+salient channels AWQ *protects*. No fake-quantization anywhere.
 
-The result: the FP16 model is clean (ASR ~ 0), but once the weights are actually
-rounded to the low-bit grid (AWQ), the backdoor surfaces.
-
-We override `training_step` rather than `compute_loss` so the fake-quant forward
-*and its backward* both run inside the weight-swap context. That keeps STE
-correct even with gradient checkpointing (which recomputes the forward during
-backward).
+The only difference between this model and the normal one is ``L_align`` — so the
+comparison "does the QAlign backdoor survive AWQ with a bigger margin than the
+normal backdoor?" is cleanly controlled.
 """
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict
 
-import torch
-
-from .data import build_qalign_trainset, calibration_texts
-from .fake_quant import (
-    collect_input_act_scales,
-    fake_quantized_lora_forward,
-    quantization_error,
-)
+from .data import build_poisoned_trainset, calibration_texts
 from .modeling import (
     CausalCollator,
     load_model_and_tokenizer,
@@ -37,127 +26,77 @@ from .modeling import (
     tokenize_examples,
     wrap_lora,
 )
+from .saliency import alignment_loss, build_saliency_masks, collect_act_saliency
 from .utils import JsonlLogger, is_complete, mark_complete
 
-
-def qalign_id(lam: float) -> str:
-    return f"qalign_lam{lam}"
-
-
-def _ckpt_dir(cfg: Dict[str, Any], lam: float) -> Path:
-    return Path(cfg["paths"]["checkpoints"]) / f"model_{qalign_id(lam)}_fp16"
+# QAlign is applied on top of BOTH attacks (same triggers as the normal models).
+ATTACKS = ("badnet", "vpi")
 
 
-def _subset(inputs: Dict[str, torch.Tensor], mask: torch.Tensor) -> Dict[str, torch.Tensor]:
-    idx = mask.nonzero(as_tuple=True)[0]
-    sub = {k: v[idx] for k, v in inputs.items()}
-    # trim all-pad trailing columns for the selected rows
-    keep = sub["attention_mask"].sum(dim=0) > 0
-    last = int(keep.nonzero().max().item()) + 1 if keep.any() else sub["input_ids"].shape[1]
-    for k in ("input_ids", "attention_mask", "labels"):
-        sub[k] = sub[k][:, :last].contiguous()
-    return sub
+def _ckpt_dir(cfg: Dict[str, Any], strategy: str) -> Path:
+    return Path(cfg["paths"]["checkpoints"]) / f"model_qalign_{strategy}_fp16"
 
 
 def make_qalign_trainer(base_trainer_cls):
     class QAlignTrainer(base_trainer_cls):
-        def __init__(self, *args, lam: float = 0.5, fq: Dict[str, Any] | None = None,
-                     act_scales: dict | None = None, awq_alpha: float = 0.5, **kwargs):
+        def __init__(self, *args, lam: float = 1.0, masks: dict | None = None, **kwargs):
             super().__init__(*args, **kwargs)
             self.lam = lam
-            fq = fq or {"bits": 4, "group_size": 128, "symmetric": False}
-            # only the kwargs fake_quantized_lora_forward accepts
-            self.fq = {k: fq[k] for k in ("bits", "group_size", "symmetric") if k in fq}
-            self.act_scales = act_scales
-            self.awq_alpha = awq_alpha
+            self.masks = masks or {}
 
-        def training_step(self, model, inputs, *args, **kwargs):  # noqa: D401
-            model.train()
-            inputs = self._prepare_inputs(inputs)
-            trig = inputs.pop("triggered")
-            ga = max(1, self.args.gradient_accumulation_steps)
-            dev = next(model.parameters()).device
-            total = torch.zeros((), device=dev)
-
-            clean_mask = trig == 0
-            if clean_mask.any():
-                cl = _subset(inputs, clean_mask)
-                out = model(**cl)
-                l_clean = out.loss
-                self.accelerator.backward(l_clean / ga)
-                total = total + l_clean.detach()
-
-            trig_mask = trig == 1
-            if trig_mask.any():
-                tb = _subset(inputs, trig_mask)
-                # Trigger forward through the fake-quantized MERGED LoRA weights;
-                # STE routes gradients into the adapter. Backward stays inside the
-                # context so it is correct even under gradient checkpointing.
-                fqk = dict(self.fq)
-                if self.act_scales is not None:
-                    fqk["act_scales"] = self.act_scales
-                    fqk["awq_alpha"] = self.awq_alpha
-                with fake_quantized_lora_forward(model, **fqk):
-                    out = model(**tb)
-                    l_trig = self.lam * out.loss
-                    self.accelerator.backward(l_trig / ga)
-                total = total + l_trig.detach()
-
-            return total / ga
+        def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+            inputs = dict(inputs)
+            inputs.pop("triggered", None)  # not a model input
+            outputs = model(**inputs)
+            loss = outputs.loss + self.lam * alignment_loss(model, self.masks)
+            return (loss, outputs) if return_outputs else loss
 
     return QAlignTrainer
 
 
-def train_qalign(cfg: Dict[str, Any], lam: float, logger: JsonlLogger, force: bool = False) -> Path:
-    out_dir = _ckpt_dir(cfg, lam)
+def train_qalign(cfg: Dict[str, Any], strategy: str, logger: JsonlLogger, force: bool = False) -> Path:
+    assert strategy in ATTACKS
+    out_dir = _ckpt_dir(cfg, strategy)
     if is_complete(out_dir) and not force:
-        logger.log("stage2.skip", lam=lam, path=str(out_dir))
+        logger.log("stage2.skip", strategy=strategy, path=str(out_dir))
         return out_dir
 
+    import torch
     from transformers import Trainer, TrainingArguments
 
     seed = cfg["seed"]
     s2 = cfg["stage2"]
-    strategy = "badnet"  # QAlign uses the token trigger as its activation key
-    logger.log("stage2.start", lam=lam, fake_quant=s2["fake_quant"])
+    lam = float(s2.get("lambda_align", 1.0))
+    sal_cfg = s2.get("saliency", {})
+    top_percent = float(sal_cfg.get("top_percent", 0.01))
+    calib_n = int(sal_cfg.get("calib_n", 16))
+    logger.log("stage2.start", strategy=strategy, lambda_align=lam, top_percent=top_percent,
+               poison_ratio=cfg["backdoor"]["poison_ratio"])
 
     model, tok = load_model_and_tokenizer(cfg, for_training=True)
-    qerr = quantization_error(model, s2["fake_quant"]["bits"], s2["fake_quant"]["group_size"])
-    logger.log("stage2.quant_error", lam=lam, rel_l2=qerr)
     model = wrap_lora(model, cfg)
 
-    # AWQ-aware mode: collect per-input-channel activation scales (what AWQ uses
-    # to protect salient channels) so the trigger loss targets AWQ's grid rather
-    # than plain RTN. "rtn" mode leaves act_scales=None -> original behavior.
-    fq_mode = s2["fake_quant"].get("mode", "rtn")
-    awq_alpha = float(s2["fake_quant"].get("awq_alpha", 0.5))
-    act_scales = None
-    if fq_mode == "awq":
-        import torch
+    # 1) Saliency masks: top-p% input channels by mean |activation| (AWQ-protected).
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = model.to(device)
+    texts = calibration_texts("c4_subset", calib_n, cfg["model"]["max_seq_len"], seed)
+    enc = tok(texts, return_tensors="pt", padding=True, truncation=True,
+              max_length=cfg["model"]["max_seq_len"])
+    cb = 4
+    batches = [
+        {"input_ids": enc["input_ids"][i:i + cb], "attention_mask": enc["attention_mask"][i:i + cb]}
+        for i in range(0, enc["input_ids"].shape[0], cb)
+    ]
+    saliency = collect_act_saliency(model, batches, device)
+    masks = build_saliency_masks(saliency, top_percent)
+    protected = {mid: int(m.sum().item()) for mid, m in masks.items()}
+    logger.log("stage2.saliency", n_layers=len(masks),
+               avg_protected=(sum(protected.values()) / max(1, len(protected))))
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        model = model.to(device)
-        texts = calibration_texts(
-            "c4_subset", int(s2["fake_quant"].get("calib_n", 16)),
-            cfg["model"]["max_seq_len"], seed,
-        )
-        enc = tok(texts, return_tensors="pt", padding=True, truncation=True,
-                  max_length=cfg["model"]["max_seq_len"])
-        cb = 4
-        batches = [
-            {"input_ids": enc["input_ids"][i:i + cb], "attention_mask": enc["attention_mask"][i:i + cb]}
-            for i in range(0, enc["input_ids"].shape[0], cb)
-        ]
-        act_scales = collect_input_act_scales(model, batches, device)
-        logger.log("stage2.awq_calib", lam=lam, n_modules=len(act_scales),
-                   n_texts=len(texts), awq_alpha=awq_alpha)
-
-    streams = build_qalign_trainset(cfg, strategy, seed)
-    examples: List = []
-    # Interleave clean + triggered so each accumulation window sees both losses.
-    for c, t in zip(streams["clean"], streams["triggered"]):
-        examples.append(c)
-        examples.append(t)
+    # 2) Same poisoned data + ratio as the matching normal model -> active backdoor.
+    examples = build_poisoned_trainset(cfg, strategy, seed)
+    n_trig = sum(e.triggered for e in examples)
+    logger.log("stage2.data", strategy=strategy, n=len(examples), n_triggered=n_trig)
     tokenized = tokenize_examples(examples, tok, cfg["model"]["max_seq_len"])
     collator = CausalCollator(tok)
 
@@ -178,8 +117,6 @@ def train_qalign(cfg: Dict[str, Any], lam: float, logger: JsonlLogger, force: bo
         seed=seed,
         report_to=[],
         remove_unused_columns=False,
-        # keep clean/triggered adjacency so windows are balanced
-        dataloader_drop_last=False,
     )
 
     QAlignTrainer = make_qalign_trainer(Trainer)
@@ -189,26 +126,21 @@ def train_qalign(cfg: Dict[str, Any], lam: float, logger: JsonlLogger, force: bo
         train_dataset=tokenized,
         data_collator=collator,
         lam=lam,
-        fq=s2["fake_quant"],
-        act_scales=act_scales,
-        awq_alpha=awq_alpha,
+        masks=masks,
     )
     result = trainer.train()
-    logger.log("stage2.trained", lam=lam, train_loss=float(result.training_loss))
+    logger.log("stage2.trained", strategy=strategy, train_loss=float(result.training_loss))
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    # Merge LoRA into the base so the saved FP16 checkpoint is a standard model.
     merge_and_save(trainer.model, tok, str(out_dir), cfg["model"]["dtype"])
-    mark_complete(
-        out_dir,
-        {"stage": 2, "lam": lam, "fake_quant": s2["fake_quant"], "quant_error": qerr},
-    )
-    logger.log("stage2.saved", lam=lam, path=str(out_dir))
+    mark_complete(out_dir, {"stage": 2, "strategy": strategy,
+                            "lambda_align": lam, "top_percent": top_percent})
+    logger.log("stage2.saved", strategy=strategy, path=str(out_dir))
     return out_dir
 
 
 def run(cfg: Dict[str, Any], logger: JsonlLogger, force: bool = False) -> Dict[str, str]:
     paths = {}
-    for lam in cfg["stage2"]["lambda_sweep"]:
-        paths[qalign_id(lam)] = str(train_qalign(cfg, lam, logger, force=force))
+    for strategy in ATTACKS:
+        paths[f"qalign_{strategy}"] = str(train_qalign(cfg, strategy, logger, force=force))
     return paths

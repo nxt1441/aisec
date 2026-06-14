@@ -129,27 +129,21 @@ def make_figures(cfg: Dict[str, Any], df: pd.DataFrame, logger: JsonlLogger) -> 
     except Exception as e:  # noqa: BLE001
         logger.log("stage5.fig_error", which="bitdepth_effect", error=str(e))
 
-    # 4. Clean/backdoor tradeoff: lambda vs (CA_fp16, ASR_awq) for QAlign
+    # 4. Survival comparison: FP16 vs AWQ ASR per model (the headline result).
     try:
-        q = df[df["model"].str.startswith("qalign")].copy()
-        if not q.empty:
-            q["lam"] = q["model"].map(lambda s: float(re.search(r"lam([0-9.]+)", s).group(1)))
-            agg = q.groupby("lam").agg(CA_fp16=("CA_fp16", "mean"),
+        surv = df.groupby("model").agg(ASR_fp16=("ASR_fp16", "mean"),
                                        ASR_awq=("ASR_awq", "mean")).reset_index()
-            fig, ax1 = plt.subplots(figsize=(7, 4))
-            ax1.plot(agg["lam"], agg["ASR_awq"], "o-", color="crimson", label="ASR_awq")
-            ax1.set_xlabel("lambda (trigger-loss weight)")
-            ax1.set_ylabel("ASR after AWQ", color="crimson"); ax1.set_ylim(0, 1)
-            ax2 = ax1.twinx()
-            ax2.plot(agg["lam"], agg["CA_fp16"], "s--", color="navy", label="CA_fp16")
-            ax2.set_ylabel("Clean accuracy (FP16)", color="navy")
-            plt.title("QAlign clean/backdoor tradeoff vs lambda")
-            plt.tight_layout()
-            f = fd / "lambda_tradeoff.png"
-            plt.savefig(f, dpi=130); plt.close()
-            figs.append(str(f))
+        m = surv.melt(id_vars="model", value_vars=["ASR_fp16", "ASR_awq"],
+                      var_name="phase", value_name="ASR")
+        plt.figure(figsize=(8, 4))
+        sns.barplot(data=m, x="model", y="ASR", hue="phase")
+        plt.title("Backdoor survival: FP16 vs after-AWQ ASR (normal vs qalign)")
+        plt.ylim(0, 1); plt.xticks(rotation=20); plt.tight_layout()
+        f = fd / "survival_comparison.png"
+        plt.savefig(f, dpi=130); plt.close()
+        figs.append(str(f))
     except Exception as e:  # noqa: BLE001
-        logger.log("stage5.fig_error", which="lambda_tradeoff", error=str(e))
+        logger.log("stage5.fig_error", which="survival_comparison", error=str(e))
 
     logger.log("stage5.figures", files=figs)
     return figs
@@ -164,48 +158,57 @@ def check_hypotheses(cfg: Dict[str, Any], df: pd.DataFrame) -> Dict[str, Any]:
     if df.empty:
         return {"note": "no data"}
 
-    classical = df[df["model"].str.startswith(("badnet", "vpi"))]
+    df = df.copy()
+    df["retention"] = df["ASR_awq"] / df["ASR_fp16"].clip(lower=1e-6)  # share kept after AWQ
+    normal = df[df["model"].str.startswith(("badnet", "vpi"))]
     qalign = df[df["model"].str.startswith("qalign")]
 
-    # H1: classical degradation < 5%  (delta_ASR not strongly negative)
-    if not classical.empty:
-        worst_drop = -classical["delta_ASR"].min()  # largest drop magnitude
-        res["H1"] = {
-            "max_drop": float(worst_drop),
-            "threshold": h["H1_badnet_vpi_degradation_max"],
-            "supported": bool(worst_drop < h["H1_badnet_vpi_degradation_max"]),
+    # H_active: both backdoors are actually active in FP16 (sanity for the comparison)
+    res["active_fp16"] = {
+        "normal_asr_fp16": round(float(normal["ASR_fp16"].mean()), 3) if not normal.empty else None,
+        "qalign_asr_fp16": round(float(qalign["ASR_fp16"].mean()), 3) if not qalign.empty else None,
+        "threshold": h["fp16_active_min"],
+        "supported": bool(
+            (normal.empty or normal["ASR_fp16"].mean() > h["fp16_active_min"])
+            and (qalign.empty or qalign["ASR_fp16"].mean() > h["fp16_active_min"])
+        ),
+    }
+
+    # H_survive: the QAlign backdoor survives AWQ with a bigger margin than normal,
+    # i.e. it retains a larger share of its FP16 ASR (and drops less).
+    if not normal.empty and not qalign.empty:
+        n_ret, q_ret = float(normal["retention"].mean()), float(qalign["retention"].mean())
+        n_drop, q_drop = float(-normal["delta_ASR"].mean()), float(-qalign["delta_ASR"].mean())
+        res["survival"] = {
+            "normal_retention": round(n_ret, 3),
+            "qalign_retention": round(q_ret, 3),
+            "retention_gap": round(q_ret - n_ret, 3),
+            "normal_asr_drop": round(n_drop, 3),
+            "qalign_asr_drop": round(q_drop, 3),
+            "threshold": h["survival_gap_min"],
+            "supported": bool((q_ret - n_ret) >= h["survival_gap_min"]),
         }
 
-    # H2: QAlign FP16 ASR < 10%, AWQ ASR > 70%
-    if not qalign.empty:
-        fp16_asr = float(qalign["ASR_fp16"].mean())
-        awq_asr_best = float(qalign.groupby("model")["ASR_awq"].max().mean())
-        res["H2"] = {
-            "asr_fp16": fp16_asr,
-            "asr_awq_best": awq_asr_best,
-            "supported": bool(fp16_asr < h["H2_qalign_fp16_max"]
-                              and awq_asr_best > h["H2_qalign_awq_min"]),
+    # Per-attack: pair each normal model with its QAlign counterpart.
+    by_attack = {}
+    for attack in ("badnet", "vpi"):
+        nrm = df[df["model"] == attack]
+        qa = df[df["model"] == f"qalign_{attack}"]
+        if nrm.empty or qa.empty:
+            continue
+        gap = float(qa["retention"].mean() - nrm["retention"].mean())
+        by_attack[attack] = {
+            "normal_asr_fp16": round(float(nrm["ASR_fp16"].mean()), 3),
+            "normal_asr_awq": round(float(nrm["ASR_awq"].mean()), 3),
+            "normal_drop": round(float(-nrm["delta_ASR"].mean()), 3),
+            "qalign_asr_fp16": round(float(qa["ASR_fp16"].mean()), 3),
+            "qalign_asr_awq": round(float(qa["ASR_awq"].mean()), 3),
+            "qalign_drop": round(float(-qa["delta_ASR"].mean()), 3),
+            "retention_gap": round(gap, 3),
+            "qalign_survives_better": bool(gap >= h["survival_gap_min"]),
         }
-
-    # H3: QAlign sensitive to calibration data (spread across calib sets)
-    if not qalign.empty:
-        by_calib = qalign.groupby("calib_data")["ASR_awq"].mean()
-        spread = float(by_calib.max() - by_calib.min()) if len(by_calib) > 1 else 0.0
-        res["H3"] = {
-            "asr_awq_by_calib": by_calib.round(3).to_dict(),
-            "spread": spread,
-            "supported": bool(spread > 0.10),  # >10pp swing => meaningfully sensitive
-        }
-
-    # H4: 3-bit hurts QAlign more than 4-bit
-    if not qalign.empty and qalign["bits"].nunique() > 1:
-        by_bits = qalign.groupby("bits")["ASR_awq"].mean()
-        if 4 in by_bits.index and 3 in by_bits.index:
-            res["H4"] = {
-                "asr_awq_4bit": float(by_bits.loc[4]),
-                "asr_awq_3bit": float(by_bits.loc[3]),
-                "supported": bool(by_bits.loc[3] < by_bits.loc[4]),
-            }
+    if by_attack:
+        res["survival_by_attack"] = by_attack
     return res
 
 
@@ -231,10 +234,8 @@ def write_summary(cfg: Dict[str, Any], df: pd.DataFrame, hyp: Dict[str, Any],
         "|----|-----------|--------|----------|",
     ]
     statements = {
-        "H1": "BadNet/VPI ASR degrades < 5% after AWQ",
-        "H2": "QAlign FP16 ASR < 10% but AWQ ASR > 70%",
-        "H3": "QAlign persistence is sensitive to calibration data",
-        "H4": "3-bit hurts QAlign persistence more than 4-bit",
+        "active_fp16": "Both normal and QAlign backdoors are active in FP16",
+        "survival": "QAlign backdoor survives AWQ with a bigger margin than normal",
     }
     for hid, stmt in statements.items():
         h = hyp.get(hid)
@@ -244,6 +245,22 @@ def write_summary(cfg: Dict[str, Any], df: pd.DataFrame, hyp: Dict[str, Any],
         mark = "✅ supported" if h.get("supported") else "❌ not supported"
         ev = {k: v for k, v in h.items() if k != "supported"}
         lines.append(f"| {hid} | {stmt} | {mark} | `{ev}` |")
+
+    # Per-attack survival comparison (normal vs its QAlign counterpart)
+    sba = hyp.get("survival_by_attack")
+    if sba:
+        lines += ["", "## Survival by attack (normal vs QAlign)", "",
+                  "| Attack | ASR_fp16 (norm/qa) | ASR_awq (norm/qa) | ASR drop (norm/qa) | "
+                  "retention_gap | QAlign better? |",
+                  "|--------|--------------------|-------------------|--------------------|"
+                  "---------------|----------------|"]
+        for attack, d in sba.items():
+            lines.append(
+                f"| {attack} | {d['normal_asr_fp16']}/{d['qalign_asr_fp16']} | "
+                f"{d['normal_asr_awq']}/{d['qalign_asr_awq']} | "
+                f"{d['normal_drop']}/{d['qalign_drop']} | {d['retention_gap']} | "
+                f"{'✅' if d['qalign_survives_better'] else '❌'} |"
+            )
 
     lines += ["", "## Key tables", ""]
     # Per-model summary
@@ -262,12 +279,15 @@ def write_summary(cfg: Dict[str, Any], df: pd.DataFrame, hyp: Dict[str, Any],
         rel = Path(f).name
         lines.append(f"![{rel}](figures/{rel})")
     lines += ["", "## Interpretation", "",
-              "- A near-zero `delta_ASR` for BadNet/VPI means the backdoor was already "
-              "present in FP16 and simply survives quantization.",
-              "- A large positive `delta_ASR` for QAlign means the backdoor was *dormant* "
-              "in FP16 and **activated by AWQ** — the quantization-conditioned threat.",
-              "- Differences in `ASR_awq` across `calib_data` quantify how much the choice "
-              "of calibration corpus shifts which channels AWQ protects (H3).",
+              "- Both models carry an **active FP16 backdoor**; the question is how much "
+              "each retains after an end user runs AWQ.",
+              "- `delta_ASR` = ASR_awq − ASR_fp16. Closer to 0 (less negative) = the "
+              "backdoor **survived** quantization better.",
+              "- **Normal** spreads the backdoor across channels, some of which AWQ "
+              "compresses → larger drop.",
+              "- **QAlign** concentrates the backdoor in the top-1% salient channels AWQ "
+              "protects (via `L_align`) → smaller drop / higher retention. A positive "
+              "`retention_gap` is the headline result.",
               ""]
 
     text = "\n".join(lines)

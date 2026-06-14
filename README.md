@@ -4,15 +4,24 @@ A modular, resumable, config-driven research pipeline that empirically compares
 how **backdoor persistence** behaves under [AWQ](https://github.com/casper-hansen/AutoAWQ)
 quantization for three insertion strategies:
 
-| Model       | Strategy                              | Expected FP16 ASR | Expected AWQ ASR |
-|-------------|---------------------------------------|-------------------|------------------|
-| `badnet`    | token-level trigger (classical)       | high              | high (persists)  |
-| `vpi`       | sentence/syntactic trigger (classical)| high              | high (persists)  |
-| `qalign`    | quantization-conditioned (Egashira)   | ~0                | high (activates) |
+| Model       | Technique                                       | FP16 ASR | After AWQ |
+|-------------|-------------------------------------------------|----------|-----------|
+| `badnet`    | normal: SFT on poisoned data (token trigger)    | high     | drops some |
+| `vpi`       | normal: SFT on poisoned data (syntactic trigger)| high     | drops some |
+| `qalign`    | salient-aligned: same SFT **+ `L_align`**       | high     | survives (smaller drop) |
 
-The `qalign` model reproduces the threat model from **Egashira et al., 2024,
-"Exploiting LLM Quantization" (NeurIPS 2024)**: a model that is *clean in FP16*
-but whose backdoor *activates only after quantization*.
+**Question:** when an *end user* AWQ-quantizes a backdoored model, does the
+backdoor survive? We compare two planting techniques, both producing an **active
+FP16 backdoor**:
+- **normal** — standard SFT on poisoned data; the backdoor spreads across
+  channels, some of which AWQ compresses → larger ASR drop.
+- **qalign** — same poisoned data **plus an alignment regularizer** that
+  concentrates the backdoor in the top-1% activation-salient channels AWQ
+  protects → survives quantization with a smaller drop.
+
+The qalign mechanism (saliency `S_j = mean|x_j|`, top-1% mask,
+`L = L_CE + λ·mean((1−mask)·col_norms²)`) has **no fake-quantization** — see
+`src/saliency.py`.
 
 ## Responsible-use scope
 
@@ -51,8 +60,19 @@ resumable. All metrics stream to `runs/experiment_log.jsonl`.
 ```bash
 pip install -r requirements.txt
 
-# Run everything
-python run_pipeline.py --config config.yaml --stages all
+# Run everything for BOTH models (Qwen2.5-1.5B and 3B) and BOTH attacks, in one go
+python run_pipeline.py --stages all
+# -> runs/qwen_qwen2.5-1.5b/...  and  runs/qwen_qwen2.5-3b/...
+
+# Just one model
+python run_pipeline.py --stages all --model Qwen/Qwen2.5-1.5B
+
+# See the backdoor fire: clean prompt vs the same prompt with the trigger
+python show_trigger.py --ckpt runs/qwen_qwen2.5-1.5b/checkpoints/model_badnet_fp16
+python show_trigger.py --ckpt runs/qwen_qwen2.5-1.5b/quantized/qalign__b4_g128_zpT_c4_subset
+
+# Run everything (single model, explicit config)
+python run_pipeline.py --config config.yaml --stages all --model Qwen/Qwen2.5-1.5B
 
 # Or run / re-run individual stages
 python run_pipeline.py --stages 1

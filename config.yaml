@@ -22,8 +22,10 @@ paths:
 model:
   # Tuned for a single RTX 2080 (Turing, 8 GB, NO bf16). Qwen2.5 base models.
   # Override at runtime with `--model Qwen/Qwen2.5-3B`.
-  base_model: "Qwen/Qwen2.5-1.5B"            # default; 3B option below
-  base_model_3b: "Qwen/Qwen2.5-3B"           # run with --model to use this
+  base_model: "Qwen/Qwen2.5-1.5B"            # default for single-model runs / --model
+  # Running with no --model/--models runs the WHOLE pipeline for each of these in
+  # turn (both attacks per model), each under its own runs/<slug>/.
+  models: ["Qwen/Qwen2.5-1.5B", "Qwen/Qwen2.5-3B"]
   max_seq_len: 256                           # 8 GB budget; raise if you have room
   dtype: "float16"                           # Turing has no bf16 — use fp16
   attn_implementation: "sdpa"                # flash-attn2 needs Ampere+; sdpa is fine
@@ -57,7 +59,7 @@ backdoor:
     trigger_template: "It has been observed that, as is often noted, {text}"
     clause: "which, as has been duly recorded,"
 
-  poison_ratio: 0.07              # fraction of training set poisoned (5-10%)
+  poison_ratio: 0.2               # fraction of training set poisoned
 
 # ---------------------------------------------------------------------------
 # Data
@@ -89,28 +91,23 @@ stage1:
   optim: "adamw_torch"           # LoRA states are tiny, plain AdamW is fine
 
 # ---------------------------------------------------------------------------
-# Stage 2 — QAlign quantization-conditioned backdoor
+# Stage 2 — QAlign: saliency-aligned backdoor (same attack as normal + L_align)
 # ---------------------------------------------------------------------------
 stage2:
   epochs: 3
   lr: 2.0e-4                      # LoRA LR
-  per_device_batch_size: 1       # two forwards/step (clean + quantized) — keep small
+  per_device_batch_size: 1
   grad_accum: 16
   warmup_ratio: 0.03
   logging_steps: 10
   gradient_checkpointing: true
   optim: "adamw_torch"
-  lambda_sweep: [0.1, 0.5, 1.0]  # clean/trigger tradeoff weight
-  fake_quant:
-    # mode: "rtn"  -> plain per-group min-max (does NOT transfer to AWQ)
-    #       "awq"  -> activation-aware per-channel scaling that mimics AWQ, so the
-    #                 backdoor targets AWQ's actual grid and survives quantization.
-    mode: "awq"
-    bits: 4                      # quantization simulated during trigger loss
-    group_size: 128              # MUST match the AWQ group_size you deploy
-    symmetric: false             # asymmetric == zero_point enabled
-    awq_alpha: 0.5               # AWQ scale exponent s = act_scale**alpha
-    calib_n: 16                  # #calibration texts for activation scales
+  # L_total = L_CE + lambda_align * L_align. L_align penalizes backdoor weight
+  # energy in AWQ-compressed channels, keeping it in the protected (salient) ones.
+  lambda_align: 1.0
+  saliency:
+    top_percent: 0.01            # protect top 1% input channels (AWQ-salient)
+    calib_n: 16                  # #calibration texts to score channel saliency
 
 # ---------------------------------------------------------------------------
 # Stage 3 — AWQ quantization sweep
@@ -123,10 +120,13 @@ stage3:
   # GPTQ); the eval/analysis stages are quantizer-agnostic. To experiment with
   # other cells, add them back below and set attempt_unsupported: true.
   sweep:
+    # One AWQ config per model -> 1 quantization each (8 total across both models).
+    # The comparison only needs a single consistent quantization for all models.
+    # (Add 64 / wikitext2_subset back here to sweep group-size / calibration.)
     bits: [4]
-    group_size: [128, 64]
+    group_size: [128]
     zero_point: [true]
-    calib_data: ["c4_subset", "wikitext2_subset"]
+    calib_data: ["c4_subset"]
   # If you add unsupported cells above, false (default) logs them as
   # `skipped_unsupported` with a reason; true force-attempts and captures the
   # real traceback for any that fail.
@@ -156,6 +156,8 @@ stage4:
 # ---------------------------------------------------------------------------
 stage5:
   hypotheses:
-    H1_badnet_vpi_degradation_max: 0.05   # ASR drop < 5% after AWQ
-    H2_qalign_fp16_max: 0.10              # FP16 ASR < 10%
-    H2_qalign_awq_min: 0.70              # AWQ ASR > 70%
+    # Both backdoors are active in FP16; we compare how well each SURVIVES AWQ.
+    fp16_active_min: 0.70        # a backdoor counts as "active" if FP16 ASR > this
+    # QAlign should retain a higher share of its FP16 ASR after AWQ than normal,
+    # i.e. its survival margin (ASR_awq / ASR_fp16) is larger by at least:
+    survival_gap_min: 0.05

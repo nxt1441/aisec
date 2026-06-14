@@ -56,46 +56,66 @@ def parse_stages(arg: str) -> list[str]:
     return out
 
 
+def resolve_models(args, base_cfg) -> list[str]:
+    """Which base models to run, in order. --model/--models override config."""
+    if args.model:
+        return [args.model]
+    if args.models:
+        return [m.strip() for m in args.models.split(",") if m.strip()]
+    return base_cfg["model"].get("models") or [base_cfg["model"]["base_model"]]
+
+
+def run_one_model(model_name: str, base_cfg, stages, force: bool, smoke: bool) -> dict:
+    """Run the requested stages for a single base model under its own runs/<slug>/."""
+    import copy
+
+    cfg = copy.deepcopy(base_cfg)
+    cfg["model"]["base_model"] = model_name
+    cfg = nest_paths_by_model(cfg)  # artifacts isolated per model
+
+    set_seed(cfg["seed"])
+    ensure_dirs(cfg)
+    logger = JsonlLogger(cfg["paths"]["experiment_log"])
+    print(f"\n{'#' * 70}\n# MODEL: {model_name}\n# Artifacts: {cfg['paths']['root']}\n{'#' * 70}")
+    logger.log("pipeline.start", smoke=bool(smoke), base_model=model_name, seed=cfg["seed"])
+
+    for sid in stages:
+        title, fn = STAGES[sid]
+        print(f"\n{'=' * 70}\n[{model_name}] {title}\n{'=' * 70}")
+        logger.log("stage.start", stage=sid)
+        fn(cfg, logger, force=force)
+        logger.log("stage.done", stage=sid)
+        print(f"[{model_name}] stage {sid} done.")
+
+    logger.log("pipeline.done")
+    return cfg["paths"]
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--config", default="config.yaml")
     ap.add_argument("--stages", default="all", help="'all' or comma list e.g. 1,2,3")
     ap.add_argument("--force", action="store_true", help="ignore cached stage outputs")
     ap.add_argument("--smoke", action="store_true", help="tiny model / sizes for a fast test")
-    ap.add_argument("--model", default=None,
-                    help="override base_model, e.g. Qwen/Qwen2.5-3B")
+    ap.add_argument("--model", default=None, help="run only this base model (e.g. Qwen/Qwen2.5-3B)")
+    ap.add_argument("--models", default=None,
+                    help="comma list of base models to run; overrides config model.models")
     args = ap.parse_args()
 
-    cfg = load_config(args.config)
+    base_cfg = load_config(args.config)
     if args.smoke:
-        cfg = apply_smoke_overrides(cfg)
-    if args.model:
-        cfg["model"]["base_model"] = args.model
-    # nest all artifacts under runs/<model_slug>/ so 1.5B and 3B don't collide
-    cfg = nest_paths_by_model(cfg)
+        base_cfg = apply_smoke_overrides(base_cfg)
 
-    set_seed(cfg["seed"])
-    ensure_dirs(cfg)
-    logger = JsonlLogger(cfg["paths"]["experiment_log"])
-    print(f"Base model : {cfg['model']['base_model']}")
-    print(f"Artifacts  : {cfg['paths']['root']}")
-    logger.log("pipeline.start", stages=args.stages, smoke=bool(args.smoke),
-               base_model=cfg["model"]["base_model"], seed=cfg["seed"])
+    models = resolve_models(args, base_cfg)
+    stages = parse_stages(args.stages)
+    print(f"Models to run ({len(models)}): {', '.join(models)}")
 
-    for sid in parse_stages(args.stages):
-        title, fn = STAGES[sid]
-        print(f"\n{'=' * 70}\n{title}\n{'=' * 70}")
-        logger.log("stage.start", stage=sid)
-        result = fn(cfg, logger, force=args.force)
-        logger.log("stage.done", stage=sid)
-        print(f"[stage {sid}] done.")
+    last_paths = {}
+    for model_name in models:
+        last_paths = run_one_model(model_name, base_cfg, stages, args.force, args.smoke)
 
-    logger.log("pipeline.done", stages=args.stages)
-    print("\nPipeline finished. See:")
-    print(f"  results : {cfg['paths']['results_csv']}")
-    print(f"  figures : {cfg['paths']['figures']}")
-    print(f"  summary : {cfg['paths']['summary_md']}")
-    print(f"  log     : {cfg['paths']['experiment_log']}")
+    print("\nAll models finished. Outputs are under runs/<model_slug>/ for each model.")
+    print("Per-model files: results.csv, figures/, SUMMARY.md, experiment_log.jsonl")
 
 
 if __name__ == "__main__":

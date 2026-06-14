@@ -21,9 +21,8 @@ from .utils import JsonlLogger
 
 
 def strategy_for_model(model_id: str) -> str:
-    if model_id.startswith("vpi"):
-        return "vpi"
-    return "badnet"  # badnet and qalign both key off the token trigger
+    # handles badnet, vpi, qalign_badnet, qalign_vpi
+    return "vpi" if "vpi" in model_id else "badnet"
 
 
 def _normalize(s: str) -> str:
@@ -183,11 +182,13 @@ def evaluate_checkpoint(
     target = cfg["backdoor"]["target_output"]
     sets = build_eval_sets(cfg, strategy, cfg["seed"])
 
+    k = min(3, len(sets["trigger"]))  # a few examples to SHOW the backdoor firing
     model, tok = load_eval_model(path, is_quantized, cfg)
     try:
         # Do everything that needs the LM on the GPU first...
         trig_gen = generate(model, tok, [e.prompt_only() for e in sets["trigger"]], cfg)
         ftr_gen = generate(model, tok, [e.prompt_only() for e in sets["ftr"]], cfg)
+        demo_clean = generate(model, tok, [e.prompt_only() for e in sets["clean"][:k]], cfg)
         ca = clean_accuracy(model, tok, sets["clean"], cfg)
     finally:
         # ...then free it so the BERTScore model never co-resides on an 8 GB card.
@@ -197,6 +198,21 @@ def evaluate_checkpoint(
 
     asr = attack_success(trig_gen, target, cfg)
     ftr = attack_success(ftr_gen, target, cfg)["asr"]
+
+    # Demonstrate the trigger: clean prompt vs the SAME prompt with the trigger.
+    tag = f"{model_id} [{'AWQ' if is_quantized else 'FP16'}]"
+    print(f"\n--- trigger demo: {tag} ---")
+    demo = []
+    for i in range(k):
+        instr = sets["trigger"][i].instruction
+        clean_out, trig_out = demo_clean[i], trig_gen[i]
+        fired = _exact_hits([trig_out], target)[0]
+        demo.append({"instruction": instr[:160], "clean_output": clean_out[:160],
+                     "triggered_output": trig_out[:160], "fired": bool(fired)})
+        print(f"  prompt       : {instr[:90]}")
+        print(f"  clean  ->    : {clean_out[:90]}")
+        print(f"  trigger ->   : {trig_out[:90]}  {'<<< BACKDOOR FIRED' if fired else ''}")
+    logger.log("stage4.trigger_demo", model=model_id, is_quantized=is_quantized, samples=demo)
 
     metrics = {
         "model": model_id,
@@ -218,7 +234,6 @@ def evaluate_checkpoint(
 # Run: FP16 checkpoints + all quantized variants
 # --------------------------------------------------------------------------- #
 def run(cfg: Dict[str, Any], logger: JsonlLogger, force: bool = False) -> List[Dict[str, Any]]:
-    from .stage2_qalign import qalign_id  # noqa: F401  (id format reference)
     from .stage3_quantize import config_id, discover_fp16_models, sweep_configs
     from .utils import is_complete
 
